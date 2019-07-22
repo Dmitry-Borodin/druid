@@ -3,9 +3,9 @@
 use std::collections::BTreeSet;
 
 use super::path::{Path, PointId, PointType};
-use super::Tool;
+use super::{Tool, ViewPort};
 use druid::kurbo::{Affine, BezPath, Circle, CubicBez, Line, PathSeg, Point, Rect, Vec2};
-use druid::piet::{Color, FillRule::NonZero, RenderContext};
+use druid::piet::{Color, FillRule::NonZero, Piet, RenderContext};
 use druid::PaintCtx;
 
 const PATH_COLOR: Color = Color::rgb24(0x00_00_00);
@@ -22,10 +22,82 @@ const SMOOTH_SELECTED_RADIUS: f64 = 4.;
 const OFF_CURVE_RADIUS: f64 = 2.;
 const OFF_CURVE_SELECTED_RADIUS: f64 = 2.5;
 
-trait PaintHelpers: RenderContext {
+/// A context for drawing that maps between screen space and design space.
+struct DrawCtx<'a, 'b: 'a> {
+    ctx: &'a mut Piet<'b>,
+    space: ViewPort,
+}
+
+impl<'a, 'b> std::ops::Deref for DrawCtx<'a, 'b> {
+    type Target = Piet<'b>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ctx
+    }
+}
+
+impl<'a, 'b> std::ops::DerefMut for DrawCtx<'a, 'b> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ctx
+    }
+}
+
+impl<'a, 'b: 'a> DrawCtx<'a, 'b> {
+    fn new(ctx: &'a mut Piet<'b>, space: ViewPort) -> Self {
+        DrawCtx { ctx, space }
+    }
+
+    fn draw_origin(&mut self) {
+        let brush = self.solid_brush(Color::rgb24(0x_FF_AA_AA));
+        let brush1 = self.solid_brush(Color::rgb24(0x_00_00_FF));
+        let brush2 = self.solid_brush(Color::rgb24(0x_AA_AA_AA));
+        for i in -100..=100_i32 {
+            let brush = match i.abs() {
+                0 => &brush1,
+                x if x % 3 == 0 => &brush,
+                _ => &brush2,
+            };
+            let c = i as f64 * 20.0;
+            let xmax = self.space.to_screen((c, 5000.));
+            let xmin = self.space.to_screen((c, -5000.));
+            let ymax = self.space.to_screen((5000., c));
+            let ymin = self.space.to_screen((-5000., c));
+
+            if i.abs() % 3 == 0 || self.space.zoom >= 1.0 {
+                self.stroke(Line::new(xmin, xmax), brush, 1.0, None);
+                self.stroke(Line::new(ymin, ymax), brush, 1.0, None);
+            }
+        }
+    }
+
     fn draw_path(&mut self, bez: &BezPath) {
         let path_brush = self.solid_brush(PATH_COLOR);
         self.stroke(bez, &path_brush, 1.0, None);
+    }
+
+    fn draw_control_point_lines(&mut self, path: &Path) {
+        let mut prev_point = path.start_point().to_screen(self.space);
+        let mut idx = 0;
+        while idx < path.points().len() {
+            match path.points()[idx] {
+                p if p.is_on_curve() => prev_point = p.to_screen(self.space),
+                p => {
+                    self.draw_control_handle(prev_point, p.to_screen(self.space));
+                    let p1 = path.points()[idx + 1].to_screen(self.space);
+                    let p2 = path.points()[idx + 2].to_screen(self.space);
+                    self.draw_control_handle(p1, p2);
+                    idx += 2;
+                    prev_point = p2;
+                }
+            }
+            idx += 1;
+        }
+
+        if let Some(trailing) = path.trailing() {
+            if path.should_draw_trailing() {
+                self.draw_control_handle(prev_point, trailing.to_screen(self.space));
+            }
+        }
     }
 
     fn draw_control_handle(&mut self, p1: Point, p2: Point) {
@@ -130,8 +202,6 @@ trait PaintHelpers: RenderContext {
     }
 }
 
-impl<T: RenderContext> PaintHelpers for T {}
-
 struct PointStyle {
     point: Point,
     style: Style,
@@ -149,15 +219,17 @@ enum Style {
 
 struct PointIter<'a> {
     idx: usize,
+    vport: ViewPort,
     path: &'a Path,
     bez: &'a BezPath,
     sels: &'a BTreeSet<PointId>,
 }
 
 impl<'a> PointIter<'a> {
-    fn new(path: &'a Path, bez: &'a BezPath, sels: &'a BTreeSet<PointId>) -> Self {
+    fn new(path: &'a Path, vport: ViewPort, bez: &'a BezPath, sels: &'a BTreeSet<PointId>) -> Self {
         PointIter {
             idx: 0,
+            vport,
             bez,
             path,
             sels,
@@ -201,7 +273,7 @@ impl<'a> std::iter::Iterator for PointIter<'a> {
         let point = self.path.points().get(self.idx)?;
         let style = self.next_style();
         let selected = self.sels.contains(&point.id);
-        let point = point.point;
+        let point = point.to_screen(self.vport);
         self.idx += 1;
         Some(PointStyle {
             point,
@@ -211,60 +283,35 @@ impl<'a> std::iter::Iterator for PointIter<'a> {
     }
 }
 
-fn draw_control_point_lines(path: &Path, paint_ctx: &mut PaintCtx) {
-    let mut prev_point = path.start_point().point;
-    let mut idx = 0;
-    while idx < path.points().len() {
-        match path.points()[idx] {
-            p if p.is_on_curve() => prev_point = p.point,
-            p => {
-                paint_ctx
-                    .render_ctx
-                    .draw_control_handle(prev_point, p.point);
-                let p1 = path.points()[idx + 1].point;
-                let p2 = path.points()[idx + 2].point;
-                paint_ctx.render_ctx.draw_control_handle(p1, p2);
-                idx += 2;
-                prev_point = p2;
-            }
-        }
-        idx += 1;
-    }
-
-    if let Some(trailing) = path.trailing() {
-        if path.should_draw_trailing() {
-            paint_ctx
-                .render_ctx
-                .draw_control_handle(prev_point, *trailing);
-        }
-    }
-}
-
 pub(crate) fn draw_paths(
     paths: &[Path],
     sels: &BTreeSet<PointId>,
     tool: &dyn Tool,
+    space: ViewPort,
     ctx: &mut PaintCtx,
+    _mouse: Point,
 ) {
+    let mut draw_ctx = DrawCtx::new(&mut ctx.render_ctx, space);
+    draw_ctx.draw_origin();
     for path in paths {
-        let bez = path.bezier();
-        ctx.render_ctx.draw_path(&bez);
-        draw_control_point_lines(path, ctx);
-        ctx.render_ctx.draw_direction_indicator(&bez);
+        let bez = space.transform() * path.bezier().clone();
+        draw_ctx.draw_path(&bez);
+        draw_ctx.draw_control_point_lines(path);
+        draw_ctx.draw_direction_indicator(&bez);
 
-        for point in PointIter::new(path, &bez, sels) {
-            ctx.render_ctx.draw_point(point)
+        for point in PointIter::new(path, space, &bez, sels) {
+            draw_ctx.draw_point(point)
         }
 
         if let Some(pt) = path.trailing() {
             if path.should_draw_trailing() {
-                ctx.render_ctx.draw_off_curve_point(*pt, true);
+                draw_ctx.draw_off_curve_point(pt.to_screen(space), true);
             }
         }
     }
 
     if let Some(rect) = tool.selection_rect() {
-        ctx.render_ctx.draw_selection_rect(rect);
+        draw_ctx.draw_selection_rect(rect);
     }
 }
 

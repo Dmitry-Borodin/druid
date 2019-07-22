@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
+use super::ViewPort;
 use druid::kurbo::{BezPath, Point, Vec2};
 use druid::Data;
 
@@ -36,10 +37,69 @@ pub enum PointType {
     OffCurve,
 }
 
+/// A point in design space.
+///
+/// This type should only be constructed through a function that has access to,
+/// and takes account of, the current viewport.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DPoint {
+    x: f64,
+    y: f64,
+}
+
+impl DPoint {
+    fn new(x: f64, y: f64) -> DPoint {
+        assert!(x.is_finite() && y.is_finite() && x.fract() == 0. && y.fract() == 0.);
+        DPoint { x, y }
+    }
+
+    pub fn from_screen(point: Point, vport: ViewPort) -> DPoint {
+        let point = vport.transform().inverse() * point;
+        DPoint::new(point.x.round(), point.y.round())
+    }
+
+    pub fn to_screen(self, vport: ViewPort) -> Point {
+        vport.transform()
+            * Point {
+                x: self.x,
+                y: self.y,
+            }
+    }
+
+    /// Create a new `DPoint` from a `Point` in design space. This should only
+    /// be used to convert back to a `DPoint` after using `Point` to do vector
+    /// math in design space.
+    pub fn from_raw(point: impl Into<Point>) -> DPoint {
+        let point = point.into();
+        DPoint::new(point.x.round(), point.y.round())
+    }
+
+    fn to_raw(self) -> Point {
+        Point::new(self.x, self.y)
+    }
+}
+
+/// A vector in design space, used for nudging & dragging
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DVec2 {
+    x: f64,
+    y: f64,
+}
+
+impl DVec2 {
+    pub fn from_screen(vec2: Vec2, vport: ViewPort) -> DVec2 {
+        let vec2 = vport.transform().inverse() * vec2.to_point();
+        DVec2 {
+            x: vec2.x.round(),
+            y: vec2.y.round(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PathPoint {
     pub id: PointId,
-    pub point: Point,
+    point: DPoint,
     pub typ: PointType,
 }
 
@@ -47,7 +107,7 @@ pub struct PathPoint {
 pub struct Path {
     id: usize,
     points: std::sync::Arc<Vec<PathPoint>>,
-    trailing: Option<Point>,
+    trailing: Option<DPoint>,
     closed: bool,
     bezier: RefCell<BezPath>,
     bezier_stale: Cell<bool>,
@@ -63,7 +123,7 @@ impl PointType {
 }
 
 impl PathPoint {
-    fn off_curve(path: usize, point: Point) -> PathPoint {
+    fn off_curve(path: usize, point: DPoint) -> PathPoint {
         let id = PointId {
             path,
             point: next_id(),
@@ -75,7 +135,7 @@ impl PathPoint {
         }
     }
 
-    fn on_curve(path: usize, point: Point) -> PathPoint {
+    fn on_curve(path: usize, point: DPoint) -> PathPoint {
         let id = PointId {
             path,
             point: next_id(),
@@ -90,10 +150,28 @@ impl PathPoint {
     pub fn is_on_curve(&self) -> bool {
         self.typ.is_on_curve()
     }
+
+    /// The distance, in screen space, from this `PathPoint` to `point`, a point
+    /// in screen space.
+    pub fn screen_dist(&self, view: ViewPort, point: Point) -> f64 {
+        let this = view.transform() * self.raw_point();
+        this.distance(point)
+    }
+
+    /// Convert this point to point in screen space.
+    pub fn to_screen(&self, view: ViewPort) -> Point {
+        view.transform() * self.raw_point()
+    }
+
+    /// Return the raw design space point, as a `Point`. This is only used
+    /// privately, so that we use methods on `Point`.
+    fn raw_point(&self) -> Point {
+        self.point.to_raw()
+    }
 }
 
 impl Path {
-    pub fn new(point: Point) -> Path {
+    pub fn new(point: DPoint) -> Path {
         let id = next_id();
         let start = PathPoint::on_curve(id, point);
 
@@ -120,7 +198,7 @@ impl Path {
         std::sync::Arc::make_mut(&mut self.points)
     }
 
-    pub fn trailing(&self) -> Option<&Point> {
+    pub fn trailing(&self) -> Option<&DPoint> {
         self.trailing.as_ref()
     }
 
@@ -153,19 +231,19 @@ impl Path {
 
     fn make_bezier(&self) -> BezPath {
         let mut bez = BezPath::new();
-        bez.move_to(self.start_point().point);
+        bez.move_to(self.start_point().raw_point());
         let mut i = if self.closed { 0 } else { 1 };
         self.debug_print_points();
 
         while i < self.points.len() {
             if self.points[i].is_on_curve() {
-                bez.line_to(self.points[i].point);
+                bez.line_to(self.points[i].raw_point());
                 i += 1;
             } else {
                 bez.curve_to(
-                    self.points[i].point,
-                    self.points[i + 1].point,
-                    self.points[self.next_idx(i + 1)].point,
+                    self.points[i].raw_point(),
+                    self.points[i + 1].raw_point(),
+                    self.points[self.next_idx(i + 1)].raw_point(),
                 );
                 i += 3;
             }
@@ -176,12 +254,19 @@ impl Path {
         bez
     }
 
+    pub fn screen_dist(&self, vport: ViewPort, point: Point) -> f64 {
+        use std::ops::Deref;
+        let screen_bez = vport.transform() * self.bezier().deref();
+        let (_, x, y) = screen_bez.nearest(point, 0.1);
+        dbg!(Vec2::new(x, y).hypot())
+    }
+
     /// Appends a point. Called when the user clicks. This point is always a corner;
     /// if the user drags it will be converted to a curve then.
     ///
     /// Returns the id of the newly added point, or the start/end point if this
     /// closes the path.
-    pub fn append_point(&mut self, point: Point) -> PointId {
+    pub fn append_point(&mut self, point: DPoint) -> PointId {
         if !self.closed && point == self.points[0].point {
             return self.close();
         }
@@ -190,7 +275,7 @@ impl Path {
         new.id
     }
 
-    pub fn nudge_points(&mut self, points: &[PointId], v: Vec2) {
+    pub fn nudge_points(&mut self, points: &[PointId], v: DVec2) {
         let mut to_nudge = HashSet::new();
         for point in points {
             let idx = match self.points.iter().position(|p| p.id == *point) {
@@ -222,8 +307,9 @@ impl Path {
         }
     }
 
-    fn nudge_point(&mut self, idx: usize, v: Vec2) {
-        self.points_mut()[idx].point += v;
+    fn nudge_point(&mut self, idx: usize, v: DVec2) {
+        self.points_mut()[idx].point.x += v.x;
+        self.points_mut()[idx].point.y += v.y;
     }
 
     /// Returns the index for the on_curve point and the 'other' handle
@@ -250,14 +336,14 @@ impl Path {
     /// `bcp1` is the handle that has moved, and `bcp2` is the handle that needs
     /// to be adjusted.
     fn adjust_handle_angle(&mut self, bcp1: usize, on_curve: usize, bcp2: usize) {
-        let new_angle = (self.points[bcp1].point - self.points[on_curve].point) * -1.0;
-        let new_angle = new_angle / new_angle.hypot(); // unit vector
-        let handle_len = (self.points[bcp2].point - self.points[on_curve].point)
+        let new_angle = (self.points[bcp1].raw_point() - self.points[on_curve].raw_point()) * -1.0;
+        let new_angle = new_angle.normalize();
+        let handle_len = (self.points[bcp2].raw_point() - self.points[on_curve].raw_point())
             .hypot()
             .abs();
-        let new_pos = self.points[on_curve].point + new_angle * handle_len;
+        let new_pos = self.points[on_curve].raw_point() + new_angle * handle_len;
         dbg!(new_angle, handle_len, new_pos);
-        self.points_mut()[bcp2].point = new_pos;
+        self.points_mut()[bcp2].point = DPoint::from_raw(new_pos);
     }
 
     fn debug_print_points(&self) {
@@ -350,7 +436,7 @@ impl Path {
     }
 
     /// Called when the user drags (modifying the bezier control points) after clicking.
-    pub fn update_for_drag(&mut self, handle: Point) {
+    pub fn update_for_drag(&mut self, handle: DPoint) {
         assert!(!self.points.is_empty());
         if !self.last_segment_is_curve() {
             self.convert_last_to_curve(handle);
@@ -377,7 +463,7 @@ impl Path {
     }
 
     /// If the user drags after mousedown, we convert the last point to a curve.
-    fn convert_last_to_curve(&mut self, handle: Point) {
+    fn convert_last_to_curve(&mut self, handle: DPoint) {
         assert!(!self.points.is_empty());
         if self.points.len() > 1 {
             let mut prev = self.points_mut().pop().unwrap();
@@ -386,7 +472,8 @@ impl Path {
                 .trailing
                 .take()
                 .unwrap_or(self.points.last().unwrap().point);
-            let p2 = prev.point - (handle - prev.point);
+            let p2 = prev.raw_point() - (handle.to_raw() - prev.raw_point());
+            let p2 = DPoint::from_raw(p2);
             let pts = &[
                 PathPoint::off_curve(self.id, p1),
                 PathPoint::off_curve(self.id, p2),
@@ -398,13 +485,14 @@ impl Path {
     }
 
     /// Update the curve while the user drags a new control point.
-    fn update_trailing(&mut self, handle: Point) {
+    fn update_trailing(&mut self, handle: DPoint) {
         if self.points.len() > 1 {
             let len = self.points.len();
             assert!(self.points[len - 1].typ != PointType::OffCurve);
             assert!(self.points[len - 2].typ == PointType::OffCurve);
             let on_curve_pt = self.points[len - 1].point;
-            self.points_mut()[len - 2].point = on_curve_pt - (handle - on_curve_pt);
+            let new_p = on_curve_pt.to_raw() - (handle.to_raw() - on_curve_pt.to_raw());
+            self.points_mut()[len - 2].point = DPoint::from_raw(new_p);
         }
         self.trailing = Some(handle);
     }
@@ -456,5 +544,37 @@ impl Data for Path {
         self.points.same(&other.points)
             && self.closed.same(&other.closed)
             && self.trailing == other.trailing
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path_point(x: f64, y: f64) -> PathPoint {
+        PathPoint {
+            point: DPoint { x, y },
+            id: PointId { path: 0, point: 0 },
+            typ: PointType::OnCurve,
+        }
+    }
+
+    fn vport(offset: impl Into<Vec2>, zoom: f64) -> ViewPort {
+        ViewPort {
+            offset: offset.into(),
+            zoom,
+        }
+    }
+
+    #[test]
+    fn screen_dist() {
+        let point = Point::new(200., 200.);
+        let ppoint = path_point(200., 200.);
+        let vp = vport((200., 0.), 1.);
+        assert_eq!(ppoint.screen_dist(vp, point), 200.);
+        let vp = vport((0., 0.), 2.);
+        assert_eq!(ppoint.screen_dist(vp, point), point.to_vec2().hypot());
+        let vp = vport((0., 200.), 2.);
+        assert_eq!(ppoint.screen_dist(vp, point), 200.);
     }
 }

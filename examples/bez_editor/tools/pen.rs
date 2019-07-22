@@ -16,14 +16,17 @@ impl MouseDelegate<Contents> for Pen {
     }
 
     fn left_down(&mut self, canvas: &mut Contents, event: &MouseEvent) -> bool {
+        let vport = canvas.vport;
         if event.count == 1 {
             let point = match canvas.active_path() {
-                Some(path) if path.start_point().point.distance(event.pos) < MIN_POINT_DISTANCE => {
-                    path.start_point().point
+                Some(path)
+                    if path.start_point().screen_dist(vport, event.pos) < MIN_POINT_DISTANCE =>
+                {
+                    path.start_point().to_screen(vport)
                 }
                 // lock to nearest vertical or horizontal axis if shift is pressed
                 Some(path) if event.mods.shift => {
-                    let last_point = path.points().last().unwrap().point;
+                    let last_point = path.points().last().unwrap().to_screen(vport);
                     axis_locked_point(event.pos, last_point)
                 }
                 _ => event.pos,

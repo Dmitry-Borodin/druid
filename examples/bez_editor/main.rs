@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 
-use druid::kurbo::{Point, Rect, Size, Vec2};
+use druid::kurbo::{Affine, Point, Rect, Size, TranslateScale, Vec2};
 use druid::piet::{Color, RenderContext};
 use druid::shell::window::Cursor;
 use druid::shell::{runloop, WindowBuilder};
@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use druid::{
     Action, BaseState, BoxConstraints, Data, Env, Event, EventCtx, KeyCode, LayoutCtx, PaintCtx,
-    UiMain, UiState, UpdateCtx, Widget, WidgetPod,
+    UiMain, UiState, UpdateCtx, WheelEvent, Widget, WidgetPod,
 };
 
 mod draw;
@@ -33,12 +33,17 @@ mod toolbar;
 mod tools;
 
 use draw::draw_paths;
-use path::{Path, PathPoint, PointId};
+use path::{DPoint, DVec2, Path, PathPoint, PointId};
 use toolbar::{Toolbar, ToolbarState};
 use tools::{Mouse, Pen, Select, Tool};
 
 const BG_COLOR: Color = Color::rgb24(0xfb_fb_fb);
 const TOOLBAR_POSITION: Point = Point::new(8., 8.);
+const MIN_ZOOM: f64 = 0.2;
+const MAX_ZOOM: f64 = 10.;
+
+const MIN_SCROLL: f64 = -5000.;
+const MAX_SCROLL: f64 = 5000.;
 
 pub(crate) const MIN_POINT_DISTANCE: f64 = 10.0;
 
@@ -61,6 +66,87 @@ struct CanvasState {
     contents: Contents,
     mouse: Mouse,
     toolbar: ToolbarState,
+}
+
+/// The position of the view, relative to the design space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewPort {
+    offset: Vec2,
+    zoom: f64,
+}
+
+impl std::default::Default for ViewPort {
+    fn default() -> Self {
+        ViewPort {
+            offset: Vec2::ZERO,
+            zoom: 1.0,
+        }
+    }
+}
+
+impl ViewPort {
+    fn scroll(&mut self, event: &WheelEvent) {
+        let mut delta = event.delta;
+        if event.mods.shift {
+            if delta.x > delta.y {
+                delta.y = 0.;
+            } else {
+                delta.x = 0.;
+            }
+        }
+        let x = (self.offset.x - event.delta.x)
+            .min(MAX_SCROLL)
+            .max(MIN_SCROLL);
+        let y = (self.offset.y - event.delta.y)
+            .min(MAX_SCROLL)
+            .max(MIN_SCROLL);
+        self.offset = Vec2::new(x.round(), y.round());
+    }
+
+    fn zoom(&mut self, event: &WheelEvent, mouse: Point) {
+        let delta = if event.delta.x.abs() > event.delta.y.abs() {
+            event.delta.x
+        } else {
+            event.delta.y
+        };
+        // the deltas we get are big, and make zooming jumpy
+        let delta = delta.round() * 0.02;
+        if delta == 0. {
+            return;
+        }
+
+        // We want the mouse to stay fixed in design space _and_ in screen space.
+        // 1. get the pre-zoom design space location of the mouse
+        let pre_mouse = self.transform().inverse() * mouse;
+        let next_zoom = (self.zoom + delta).max(MIN_ZOOM).min(MAX_ZOOM);
+        if (next_zoom - self.zoom).abs() < 0.001 {
+            return;
+        } // eyeroll emoji
+        self.zoom = next_zoom;
+        // 2. get the post-zoom screen-space location of pre_zoom
+        let post_mouse = self.transform() * pre_mouse;
+
+        // 1. get the post-zoom design space location of the mouse
+
+        // now we want to adjust the screen offset such that these two points are aligned.
+        // or something.
+        let mouse_delta = pre_mouse - post_mouse;
+
+        //eprintln!("{:.4}: ({:.2}, {:.2}), ({:.2}, {:.2}), ({:.2}, {:.2})", self.zoom, pre_mouse.x, pre_mouse.y, post_mouse.x, post_mouse.y, mouse_delta.x, mouse_delta.y);
+        self.offset += mouse_delta;
+    }
+
+    pub fn transform(&self) -> TranslateScale {
+        TranslateScale::new(self.offset, self.zoom)
+    }
+
+    fn design_point(&self, point: impl Into<Point>) -> DPoint {
+        DPoint::from_screen(point.into(), *self)
+    }
+
+    pub fn to_screen(&self, point: impl Into<Point>) -> Point {
+        DPoint::from_raw(point.into()).to_screen(*self)
+    }
 }
 
 impl CanvasState {
@@ -92,6 +178,7 @@ pub(crate) struct Contents {
     paths: Arc<Vec<Path>>,
     /// Selected points, including the path index and the point id.
     selection: Arc<BTreeSet<PointId>>,
+    vport: ViewPort,
 }
 
 /// A helper for iterating through a selection in per-path chunks.
@@ -181,6 +268,7 @@ impl Contents {
     }
 
     pub(crate) fn new_path(&mut self, start: Point) {
+        let start = self.vport.design_point(start);
         let path = Path::new(start);
         let point = path.points()[0].id;
 
@@ -193,6 +281,7 @@ impl Contents {
         if self.active_path_idx().is_none() {
             self.new_path(point);
         } else {
+            let point = self.vport.design_point(point);
             let new_point = self.active_path_mut().unwrap().append_point(point);
             self.selection_mut().clear();
             self.selection_mut().insert(new_point);
@@ -203,6 +292,7 @@ impl Contents {
         if self.selection.is_empty() {
             return;
         }
+        let nudge = DVec2::from_screen(nudge, self.vport);
 
         let to_nudge = PathSelection::new(&self.selection);
         for path_points in to_nudge.iter() {
@@ -258,10 +348,11 @@ impl Contents {
     }
 
     pub(crate) fn select_path(&mut self, point: Point, toggle: bool) -> bool {
-        let path_idx = match self.paths.iter().position(|p| {
-            let (_, x, y) = p.bezier().nearest(point, 0.1);
-            Point::new(x, y).to_vec2().hypot() < MIN_POINT_DISTANCE
-        }) {
+        let path_idx = match self
+            .paths
+            .iter()
+            .position(|p| p.screen_dist(self.vport, point) < MIN_POINT_DISTANCE)
+        {
             Some(idx) => idx,
             None => return false,
         };
@@ -276,6 +367,7 @@ impl Contents {
     }
 
     pub(crate) fn update_for_drag(&mut self, drag_point: Point) {
+        let drag_point = DPoint::from_screen(drag_point, self.vport);
         self.active_path_mut().unwrap().update_for_drag(drag_point);
     }
 
@@ -302,7 +394,9 @@ impl Data for CanvasState {
 
 impl Data for Contents {
     fn same(&self, other: &Self) -> bool {
-        self.paths.same(&other.paths) && self.selection.same(&other.selection)
+        self.paths.same(&other.paths)
+            && self.selection.same(&other.selection)
+            && self.vport == other.vport
     }
 }
 
@@ -319,7 +413,9 @@ impl Widget<CanvasState> for Canvas {
             &data.contents.paths,
             &data.contents.selection,
             &*data.tool,
+            data.contents.vport,
             paint_ctx,
+            data.mouse.pos(),
         );
         self.toolbar
             .paint_with_offset(paint_ctx, &data.toolbar, _env);
@@ -354,6 +450,14 @@ impl Widget<CanvasState> for Canvas {
             Event::KeyUp(key) if data.toolbar.idx_for_key(key).is_some() => {
                 let idx = data.toolbar.idx_for_key(key).unwrap();
                 data.toolbar.set_selected(idx);
+                ctx.set_handled();
+            }
+            Event::Wheel(wheel) => {
+                if wheel.mods.meta {
+                    data.contents.vport.zoom(wheel, data.mouse.pos());
+                } else {
+                    data.contents.vport.scroll(wheel);
+                }
                 ctx.set_handled();
             }
             other => {

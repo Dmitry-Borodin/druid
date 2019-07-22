@@ -34,9 +34,10 @@ impl Select {
         rect: Rect,
         shift: bool,
     ) {
+        let vport = canvas.vport;
         let in_select_rect = canvas
             .iter_points()
-            .filter(|p| rect_contains(rect, p.point))
+            .filter(|p| rect_contains(rect, p.to_screen(vport)))
             .map(|p| p.id)
             .collect();
         let new_sel = if shift {
@@ -74,7 +75,7 @@ impl MouseDelegate<Contents> for Select {
         if event.count == 1 {
             let sel = canvas
                 .iter_points()
-                .find(|p| p.point.distance(event.pos) <= MIN_POINT_DISTANCE)
+                .find(|p| p.screen_dist(canvas.vport, event.pos) <= MIN_POINT_DISTANCE)
                 .map(|p| p.id);
             if let Some(point_id) = sel {
                 if !event.mods.shift {
@@ -93,7 +94,7 @@ impl MouseDelegate<Contents> for Select {
         } else if event.count == 2 {
             if canvas
                 .iter_points()
-                .find(|p| p.point.distance(event.pos) <= MIN_POINT_DISTANCE)
+                .find(|p| p.screen_dist(canvas.vport, event.pos) <= MIN_POINT_DISTANCE)
                 .map(|p| p.is_on_curve())
                 .unwrap_or(false)
             {
@@ -114,7 +115,7 @@ impl MouseDelegate<Contents> for Select {
     fn left_drag_began(&mut self, canvas: &mut Contents, drag: Drag) -> bool {
         self.prev_selection = if canvas
             .iter_points()
-            .any(|p| p.point.distance(drag.start.pos) <= MIN_POINT_DISTANCE)
+            .any(|p| p.screen_dist(canvas.vport, drag.start.pos) <= MIN_POINT_DISTANCE)
         {
             None
         } else {
